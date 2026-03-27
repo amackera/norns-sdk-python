@@ -2,7 +2,7 @@
 
 Python SDK for [Norns](https://github.com/amackera/norns) — durable agent runtime on BEAM.
 
-Define agents and tools in Python, connect to Norns as a worker. Norns handles orchestration, durability, and crash recovery. Your code handles LLM calls and tool execution.
+Define agents and tools in Python, connect to Norns as a worker or interact with agents as a client. Norns handles orchestration, durability, and crash recovery. Your code handles LLM calls, tool execution, and application logic.
 
 ## Install
 
@@ -10,7 +10,12 @@ Define agents and tools in Python, connect to Norns as a worker. Norns handles o
 pip install norns-sdk
 ```
 
-## Quick Start
+The SDK has two main classes:
+
+- **`Norns`** — the worker. Connects via WebSocket, registers agents/tools, handles LLM and tool tasks. Blocks forever.
+- **`NornsClient`** — the client. Sends messages to agents, queries run status, streams events. Used by web servers, Slack bots, CLI tools, etc.
+
+## Quick Start — Worker
 
 ```python
 import os
@@ -103,6 +108,39 @@ agent = Agent(
     max_steps=50,                          # Safety limit
     on_failure="retry_last_step",          # "stop" or "retry_last_step"
 )
+```
+
+## Quick Start — Client
+
+```python
+import os
+from norns import NornsClient
+
+client = NornsClient("http://localhost:4000", api_key=os.environ["NORNS_API_KEY"])
+
+# Fire-and-forget — returns immediately with run info
+run = client.send_message("support-bot", "Where's my order?")
+print(run.run_id)   # 42
+print(run.status)   # "accepted"
+
+# Block until completion
+result = client.send_message("support-bot", "Where's my order?", wait=True, timeout=30)
+print(result.output)  # "Your order #1234 shipped on..."
+print(result.status)  # "completed"
+
+# With conversation key (for multi-turn)
+result = client.send_message("support-bot", "And the tracking number?",
+                             conversation_key="slack:U01ABC", wait=True)
+
+# Inspect runs and events
+run = client.get_run(42)
+events = client.get_events(42)
+
+# Stream events in real time
+for event in client.stream("support-bot", "Research quantum computing"):
+    if event.type == "completed":
+        print(event.data.get("output", "")[:80])
+        break
 ```
 
 ## Async Tools

@@ -1,4 +1,4 @@
-"""Norns client — connects to the runtime as a worker."""
+"""Norns client — worker and client for the Norns durable agent runtime."""
 
 from __future__ import annotations
 
@@ -6,13 +6,24 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
+from collections.abc import Generator
 from typing import Any
 
 import anthropic
+import httpx
 import websockets
 
 from norns.agent import Agent, ToolDef
+from norns.models import (
+    AgentResponse,
+    ConversationResponse,
+    EventResponse,
+    MessageResult,
+    RunResponse,
+    StreamEvent,
+)
 
 logger = logging.getLogger("norns")
 
@@ -211,6 +222,295 @@ class Norns:
                 await ws.send(msg)
             except Exception:
                 break
+
+
+class NornsClient:
+    """Client for interacting with Norns agents.
+
+    This is the client — it sends messages and queries results.
+    For running a worker, use the Norns class instead.
+
+    Usage:
+        client = NornsClient("http://localhost:4000", api_key="nrn_...")
+        run = client.send_message("support-bot", "Hello!")
+        result = client.send_message("support-bot", "Hello!", wait=True)
+    """
+
+    def __init__(self, url: str, *, api_key: str | None = None):
+        self.base_url = url.rstrip("/")
+        self.api_key = api_key or os.environ.get("NORNS_API_KEY", "")
+        self._ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
+        self._client = httpx.Client(
+            base_url=self.base_url,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
+
+    def close(self):
+        """Close the underlying HTTP client."""
+        self._client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Make an authenticated HTTP request."""
+        response = self._client.request(method, path, **kwargs)
+        response.raise_for_status()
+        return response
+
+    # --- Agent Management ---
+
+    def list_agents(self) -> list[AgentResponse]:
+        """List all agents."""
+        resp = self._request("GET", "/api/v1/agents")
+        return [_parse_agent(a) for a in resp.json()["data"]]
+
+    def get_agent(self, id_or_name: int | str) -> AgentResponse:
+        """Get an agent by ID or name.
+
+        If a string is passed, resolves by listing agents and filtering by name.
+        """
+        if isinstance(id_or_name, int):
+            resp = self._request("GET", f"/api/v1/agents/{id_or_name}")
+            return _parse_agent(resp.json()["data"])
+
+        agents = self.list_agents()
+        for agent in agents:
+            if agent.name == id_or_name:
+                return agent
+        raise ValueError(f"Agent not found: {id_or_name}")
+
+    def _resolve_agent_id(self, agent: int | str) -> int:
+        """Resolve an agent identifier to an integer ID."""
+        if isinstance(agent, int):
+            return agent
+        return self.get_agent(agent).id
+
+    # --- Sending Messages ---
+
+    def send_message(
+        self,
+        agent: int | str,
+        content: str,
+        *,
+        conversation_key: str | None = None,
+        wait: bool = False,
+        timeout: float = 30,
+    ) -> MessageResult:
+        """Send a message to an agent.
+
+        Args:
+            agent: Agent ID (int) or name (str).
+            content: The message content.
+            conversation_key: Optional key for multi-turn conversations.
+            wait: If True, poll until the run completes or times out.
+            timeout: Seconds to wait when wait=True.
+
+        Returns:
+            MessageResult with run_id, status, and output (if wait=True and completed).
+        """
+        agent_id = self._resolve_agent_id(agent)
+        body: dict[str, Any] = {"content": content}
+        if conversation_key is not None:
+            body["conversation_key"] = conversation_key
+
+        resp = self._request("POST", f"/api/v1/agents/{agent_id}/messages", json=body)
+        data = resp.json()
+        run_id = data["run_id"]
+        status = data.get("status", "accepted")
+
+        if not wait:
+            return MessageResult(
+                run_id=run_id,
+                status=status,
+                output=None,
+                conversation_key=conversation_key,
+            )
+
+        # Poll until completion or timeout
+        deadline = time.monotonic() + timeout
+        poll_interval = 0.5
+        while time.monotonic() < deadline:
+            run = self.get_run(run_id)
+            if run.status in ("completed", "failed", "error"):
+                return MessageResult(
+                    run_id=run_id,
+                    status=run.status,
+                    output=run.output,
+                    conversation_key=conversation_key,
+                )
+            time.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.5, 3.0)
+
+        raise TimeoutError(f"Run {run_id} did not complete within {timeout}s")
+
+    # --- Run Inspection ---
+
+    def get_run(self, run_id: int) -> RunResponse:
+        """Get details of a run."""
+        resp = self._request("GET", f"/api/v1/runs/{run_id}")
+        data = resp.json()["data"]
+        return RunResponse(
+            run_id=data["id"],
+            status=data["status"],
+            output=data.get("output"),
+            agent_id=data["agent_id"],
+            conversation_id=data.get("conversation_id"),
+            trigger_type=data.get("trigger_type", "message"),
+            inserted_at=data["inserted_at"],
+        )
+
+    def get_events(self, run_id: int) -> list[EventResponse]:
+        """Get the event log for a run."""
+        resp = self._request("GET", f"/api/v1/runs/{run_id}/events")
+        return [
+            EventResponse(
+                id=e["id"],
+                sequence=e["sequence"],
+                event_type=e["event_type"],
+                payload=e.get("payload", {}),
+                source=e.get("source", ""),
+                inserted_at=e["inserted_at"],
+            )
+            for e in resp.json()["data"]
+        ]
+
+    # --- Conversations ---
+
+    def list_conversations(self, agent: int | str) -> list[ConversationResponse]:
+        """List conversations for an agent."""
+        agent_id = self._resolve_agent_id(agent)
+        resp = self._request("GET", f"/api/v1/agents/{agent_id}/conversations")
+        return [
+            ConversationResponse(
+                id=c["id"],
+                agent_id=c["agent_id"],
+                key=c["key"],
+                message_count=c.get("message_count", 0),
+                token_estimate=c.get("token_estimate", 0),
+            )
+            for c in resp.json()["data"]
+        ]
+
+    def get_conversation(self, agent: int | str, key: str) -> ConversationResponse:
+        """Get a specific conversation by key."""
+        agent_id = self._resolve_agent_id(agent)
+        resp = self._request("GET", f"/api/v1/agents/{agent_id}/conversations/{key}")
+        c = resp.json()["data"]
+        return ConversationResponse(
+            id=c["id"],
+            agent_id=c["agent_id"],
+            key=c["key"],
+            message_count=c.get("message_count", 0),
+            token_estimate=c.get("token_estimate", 0),
+        )
+
+    def delete_conversation(self, agent: int | str, key: str) -> None:
+        """Delete a conversation (reset)."""
+        agent_id = self._resolve_agent_id(agent)
+        self._request("DELETE", f"/api/v1/agents/{agent_id}/conversations/{key}")
+
+    # --- Streaming ---
+
+    def stream(
+        self,
+        agent: int | str,
+        content: str,
+        *,
+        conversation_key: str | None = None,
+        timeout: float = 120,
+    ) -> Generator[StreamEvent, None, None]:
+        """Send a message and stream events as they happen.
+
+        Yields StreamEvent objects until the run completes or errors.
+        """
+        agent_id = self._resolve_agent_id(agent)
+
+        # Send the message first (fire-and-forget)
+        body: dict[str, Any] = {"content": content}
+        if conversation_key is not None:
+            body["conversation_key"] = conversation_key
+        resp = self._request("POST", f"/api/v1/agents/{agent_id}/messages", json=body)
+        run_id = resp.json()["run_id"]
+
+        # Stream via WebSocket
+        yield from _stream_events(self._ws_url, self.api_key, agent_id, run_id, timeout)
+
+
+def _stream_events(
+    ws_url: str,
+    api_key: str,
+    agent_id: int,
+    run_id: int,
+    timeout: float,
+) -> Generator[StreamEvent, None, None]:
+    """Connect to Phoenix WebSocket and yield events for a run."""
+    url = f"{ws_url}/socket/websocket?token={api_key}&vsn=2.0.0"
+    topic = f"agent:{agent_id}"
+    ref_counter = 0
+
+    def next_ref() -> str:
+        nonlocal ref_counter
+        ref_counter += 1
+        return str(ref_counter)
+
+    with websockets.sync.client.connect(url) as ws:
+        ws.settimeout(timeout)
+
+        # Join the agent channel
+        join_ref = next_ref()
+        join_msg = json.dumps([join_ref, next_ref(), topic, "phx_join", {"run_id": run_id}])
+        ws.send(join_msg)
+
+        # Wait for join reply
+        reply = json.loads(ws.recv())
+        if isinstance(reply, list) and len(reply) >= 5 and reply[3] == "phx_reply":
+            status = reply[4].get("status")
+            if status != "ok":
+                raise ConnectionError(f"Failed to join channel {topic}: {reply[4]}")
+
+        # Read events
+        while True:
+            try:
+                raw = ws.recv()
+            except TimeoutError:
+                raise TimeoutError(f"Stream timed out after {timeout}s")
+
+            msg = json.loads(raw)
+            if not isinstance(msg, list) or len(msg) < 5:
+                continue
+
+            _join_ref, _ref, _topic, event, payload = msg
+
+            if event in ("phx_reply", "phx_close", "phx_error", "heartbeat"):
+                if event == "phx_error":
+                    yield StreamEvent(type="error", data=payload)
+                    return
+                if event == "phx_close":
+                    return
+                continue
+
+            stream_event = StreamEvent(type=event, data=payload)
+            yield stream_event
+
+            if event in ("completed", "error"):
+                return
+
+
+def _parse_agent(data: dict) -> AgentResponse:
+    """Parse an agent dict from the API into an AgentResponse."""
+    return AgentResponse(
+        id=data["id"],
+        name=data["name"],
+        status=data.get("status", "active"),
+        model=data.get("model", ""),
+        mode=data.get("mode", "task"),
+        system_prompt=data.get("system_prompt", ""),
+        max_steps=data.get("max_steps", 50),
+    )
 
 
 def _content_block_to_dict(block) -> dict:
