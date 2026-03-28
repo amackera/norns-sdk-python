@@ -50,12 +50,47 @@ class Norns:
     def run(self, agent: Agent, *, llm_api_key: str | None = None, worker_id: str | None = None):
         """Connect as a worker, register the agent, and handle tasks forever.
 
+        Auto-creates the agent via REST if it doesn't exist yet.
         This blocks — like a Temporal worker.
         """
+        self._ensure_agent(agent)
+
         llm_key = llm_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         wid = worker_id or f"python-worker-{uuid.uuid4().hex[:8]}"
 
         asyncio.run(self._run_loop(agent, llm_key, wid))
+
+    def _ensure_agent(self, agent: Agent):
+        """Create the agent via REST API if it doesn't already exist."""
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        with httpx.Client(base_url=self.url, headers=headers) as client:
+            resp = client.get("/api/v1/agents")
+            resp.raise_for_status()
+            existing = resp.json().get("data", [])
+
+            for a in existing:
+                if a["name"] == agent.name:
+                    logger.info(f"Agent '{agent.name}' already exists (id={a['id']})")
+                    return
+
+            body = {
+                "name": agent.name,
+                "system_prompt": agent.system_prompt,
+                "status": "idle",
+                "model": agent.model,
+                "max_steps": agent.max_steps,
+                "model_config": {
+                    "mode": agent.mode,
+                    "checkpoint_policy": agent.checkpoint_policy,
+                    "context_strategy": agent.context_strategy,
+                    "context_window": agent.context_window,
+                    "on_failure": agent.on_failure,
+                },
+            }
+            resp = client.post("/api/v1/agents", json=body)
+            resp.raise_for_status()
+            created = resp.json()["data"]
+            logger.info(f"Created agent '{agent.name}' (id={created['id']})")
 
     async def _run_loop(self, agent: Agent, llm_api_key: str, worker_id: str):
         """Main event loop: connect, register, handle tasks, reconnect on failure."""
