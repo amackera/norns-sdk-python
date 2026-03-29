@@ -118,6 +118,7 @@ class Norns:
 
         async with websockets.connect(ws_url) as ws:
             logger.info(f"Connected to {self.url}")
+            self._ref_counter = 1
 
             # Phoenix channel join
             join_payload = {
@@ -150,11 +151,15 @@ class Norns:
                     _join_ref, _ref, _topic, event, payload = msg
 
                     if event == "llm_task":
+                        logger.info(f"Received llm_task (task_id={payload.get('task_id')}), tools_payload={payload.get('tools')}")
                         result = await self._handle_llm_task(payload, llm_client)
+                        logger.info(f"LLM result: status={result.get('status')}, sending back")
                         await self._send_result(ws, payload, result)
 
                     elif event == "tool_task":
+                        logger.info(f"Received tool_task: {payload.get('tool_name')} (task_id={payload.get('task_id')})")
                         result = await self._handle_tool_task(payload, tools_by_name)
+                        logger.info(f"Tool result: status={result.get('status')}, sending back")
                         await self._send_result(ws, payload, result)
 
                     elif event == "phx_error":
@@ -169,7 +174,11 @@ class Norns:
                 heartbeat_task.cancel()
 
     async def _handle_llm_task(self, task: dict, client: anthropic.Anthropic | None) -> dict:
-        """Execute an LLM call via the Anthropic API."""
+        """Execute an LLM call via the Anthropic API.
+
+        Receives provider-neutral format from Norns, translates to Anthropic,
+        calls the API, and translates the response back to neutral format.
+        """
         if client is None:
             return {"status": "error", "error": "No LLM API key configured"}
 
@@ -177,36 +186,21 @@ class Norns:
             model = task.get("model", "claude-sonnet-4-20250514")
             system_prompt = task.get("system_prompt", "")
             messages = task.get("messages", [])
-            tools = task.get("opts", {}).get("tools") if isinstance(task.get("opts"), dict) else None
-
-            # Handle opts as list (Elixir keyword list serialized)
-            if isinstance(task.get("opts"), list):
-                for item in task["opts"]:
-                    if isinstance(item, dict) and "tools" in item:
-                        tools = item["tools"]
+            tools = task.get("tools", [])
 
             kwargs: dict[str, Any] = {
                 "model": model,
                 "max_tokens": 4096,
                 "system": system_prompt,
-                "messages": messages,
+                "messages": _to_anthropic_messages(messages),
             }
             if tools:
-                kwargs["tools"] = tools
+                kwargs["tools"] = _to_anthropic_tools(tools)
+
+            logger.info(f"LLM call: model={model}, tools={[t.get('name') for t in tools]}, msg_count={len(messages)}")
 
             response = client.messages.create(**kwargs)
-
-            content = [_content_block_to_dict(block) for block in response.content]
-
-            return {
-                "status": "ok",
-                "content": content,
-                "stop_reason": response.stop_reason,
-                "usage": {
-                    "input_tokens": response.usage.input_tokens,
-                    "output_tokens": response.usage.output_tokens,
-                },
-            }
+            return _from_anthropic_response(response)
 
         except anthropic.RateLimitError as e:
             logger.warning(f"Rate limited, returning error to orchestrator: {e}")
@@ -218,7 +212,7 @@ class Norns:
 
     async def _handle_tool_task(self, task: dict, tools: dict[str, ToolDef]) -> dict:
         """Execute a tool call."""
-        tool_name = task.get("tool_name", "")
+        tool_name = task.get("tool_name", task.get("name", ""))
         input_data = task.get("input", {})
 
         tool = tools.get(tool_name)
@@ -243,8 +237,11 @@ class Norns:
         task_id = task.get("task_id", "")
         result["task_id"] = task_id
 
-        msg = json.dumps([None, None, "worker:lobby", "tool_result", result])
+        self._ref_counter += 1
+        ref = str(self._ref_counter)
+        msg = json.dumps(["1", ref, "worker:lobby", "tool_result", result])
         await ws.send(msg)
+        logger.debug(f"Sent result for task {task_id}: {result.get('status')}")
 
     async def _heartbeat(self, ws):
         """Send Phoenix heartbeat to keep the connection alive."""
@@ -548,16 +545,115 @@ def _parse_agent(data: dict) -> AgentResponse:
     )
 
 
-def _content_block_to_dict(block) -> dict:
-    """Convert an Anthropic content block to a plain dict."""
-    if hasattr(block, "type"):
-        if block.type == "text":
-            return {"type": "text", "text": block.text}
-        elif block.type == "tool_use":
-            return {
-                "type": "tool_use",
-                "id": block.id,
-                "name": block.name,
-                "input": block.input,
-            }
-    return {"type": "unknown"}
+def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
+    """Translate neutral-format messages to Anthropic API format.
+
+    Neutral:
+      - assistant messages have optional "tool_calls" array with "arguments"
+      - tool results are role "tool" with "tool_call_id" and "name"
+    Anthropic:
+      - tool calls are content blocks with type "tool_use" and "input"
+      - tool results are content blocks inside user messages with type "tool_result"
+    """
+    anthropic_msgs: list[dict] = []
+
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role", "")
+
+        if role == "user":
+            anthropic_msgs.append({"role": "user", "content": msg.get("content", "")})
+
+        elif role == "assistant":
+            content_blocks: list[dict] = []
+            text = msg.get("content", "")
+            if text:
+                content_blocks.append({"type": "text", "text": text})
+
+            for tc in msg.get("tool_calls", []):
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc["name"],
+                    "input": tc.get("arguments", {}),
+                })
+
+            if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
+                anthropic_msgs.append({"role": "assistant", "content": text})
+            else:
+                anthropic_msgs.append({"role": "assistant", "content": content_blocks})
+
+        elif role == "tool":
+            # Collect consecutive tool results into one user message
+            tool_results: list[dict] = []
+            while i < len(messages) and messages[i].get("role") == "tool":
+                t = messages[i]
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": t["tool_call_id"],
+                    "content": t.get("content", ""),
+                    **({"is_error": True} if t.get("is_error") else {}),
+                })
+                i += 1
+            anthropic_msgs.append({"role": "user", "content": tool_results})
+            continue  # skip the i += 1 at the bottom
+
+        i += 1
+
+    return anthropic_msgs
+
+
+def _to_anthropic_tools(tools: list[dict]) -> list[dict]:
+    """Translate neutral tool definitions to Anthropic format.
+
+    Neutral uses "parameters", Anthropic uses "input_schema".
+    """
+    return [
+        {
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "input_schema": t.get("parameters", {}),
+        }
+        for t in tools
+    ]
+
+
+def _from_anthropic_response(response) -> dict:
+    """Translate an Anthropic API response to neutral wire format."""
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+
+    for block in response.content:
+        if hasattr(block, "type"):
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "arguments": block.input,
+                })
+
+    # Map Anthropic stop_reason to neutral finish_reason
+    stop_reason_map = {
+        "end_turn": "stop",
+        "tool_use": "tool_call",
+        "max_tokens": "length",
+        "stop_sequence": "stop",
+    }
+    finish_reason = stop_reason_map.get(response.stop_reason, response.stop_reason)
+
+    result: dict[str, Any] = {
+        "status": "ok",
+        "content": "\n\n".join(text_parts),
+        "finish_reason": finish_reason,
+        "usage": {
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        },
+    }
+    if tool_calls:
+        result["tool_calls"] = tool_calls
+
+    return result
