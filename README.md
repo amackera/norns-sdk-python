@@ -134,6 +134,11 @@ agent = Agent(
 )
 ```
 
+## Docs
+
+- [Messaging client design](docs/messaging-client-design.md)
+- [Remaining work](docs/remaining-work.md)
+
 ## License
 
 MIT

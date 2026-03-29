@@ -30,18 +30,7 @@
 
 ### Server-side (Norns runtime repo)
 
-**1. Return `run_id` in send_message response** — BLOCKER
-
-The SDK client's `send_message(wait=True)` and `stream()` both depend on knowing the `run_id` to poll or subscribe. Currently the server returns `{"status": "accepted"}` with no run ID.
-
-Fix: `Registry.send_message` needs to return the run ID. The agent process creates the run in `handle_cast({:send_message, ...})` but that's async (cast, not call). Options:
-- Change to `call` instead of `cast` and return the run_id
-- Have `send_message` create the run before dispatching to the agent
-- Return the most recent run for the agent after a short delay (hacky)
-
-The first option is cleanest — make `send_message` a synchronous call that creates the run and returns the ID before entering the LLM loop.
-
-**2. Agent lookup by name** — NICE TO HAVE
+**1. Agent lookup by name** — NICE TO HAVE
 
 The client resolves names by listing all agents and filtering. This works but is O(n). Add `GET /api/v1/agents?name=support-bot` or make `GET /api/v1/agents/:id` accept a name string.
 
@@ -86,8 +75,7 @@ Currently `norns.run(agent)` takes one agent. Should support `norns.run([agent1,
 
 ## Priority order
 
-1. **Return `run_id` from send_message** (server-side, blocks client `wait=True`)
-2. **End-to-end integration test** (proves the whole thing works)
-3. **Worker graceful shutdown** (SIGINT handling)
-4. **Examples** (shows people how to use it)
-5. Everything else
+1. **End-to-end integration test** (proves the whole thing works)
+2. **Worker graceful shutdown** (SIGINT handling)
+3. **Examples** (shows people how to use it)
+4. Everything else
