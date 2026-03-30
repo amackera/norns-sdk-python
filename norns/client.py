@@ -11,8 +11,8 @@ import uuid
 from collections.abc import Generator
 from typing import Any
 
-import anthropic
 import httpx
+import litellm
 import websockets
 
 from norns.agent import Agent, ToolDef
@@ -52,13 +52,16 @@ class Norns:
 
         Auto-creates the agent via REST if it doesn't exist yet.
         This blocks — like a Temporal worker.
+
+        LLM API keys are read from environment variables by LiteLLM
+        (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.). The llm_api_key
+        parameter is accepted for backwards compatibility but ignored.
         """
         self._ensure_agent(agent)
 
-        llm_key = llm_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         wid = worker_id or f"python-worker-{uuid.uuid4().hex[:8]}"
 
-        asyncio.run(self._run_loop(agent, llm_key, wid))
+        asyncio.run(self._run_loop(agent, wid))
 
     def _ensure_agent(self, agent: Agent):
         """Create the agent via REST API if it doesn't already exist."""
@@ -92,13 +95,14 @@ class Norns:
             created = resp.json()["data"]
             logger.info(f"Created agent '{agent.name}' (id={created['id']})")
 
-    async def _run_loop(self, agent: Agent, llm_api_key: str, worker_id: str):
+    async def _run_loop(self, agent: Agent, worker_id: str):
         """Main event loop: connect, register, handle tasks, reconnect on failure."""
         tools_by_name = {t.name: t for t in agent.tools}
+        self._llm_provider = agent.llm_provider
 
         while True:
             try:
-                await self._connect_and_serve(agent, llm_api_key, worker_id, tools_by_name)
+                await self._connect_and_serve(agent, worker_id, tools_by_name)
             except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
                 logger.warning(f"Connection lost: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
@@ -109,7 +113,6 @@ class Norns:
     async def _connect_and_serve(
         self,
         agent: Agent,
-        llm_api_key: str,
         worker_id: str,
         tools_by_name: dict[str, ToolDef],
     ):
@@ -135,9 +138,6 @@ class Norns:
             resp_data = json.loads(response)
             logger.info(f"Joined worker:lobby as {worker_id}")
 
-            # Create Anthropic client
-            llm_client = anthropic.Anthropic(api_key=llm_api_key) if llm_api_key else None
-
             # Heartbeat task
             heartbeat_task = asyncio.create_task(self._heartbeat(ws))
 
@@ -151,8 +151,8 @@ class Norns:
                     _join_ref, _ref, _topic, event, payload = msg
 
                     if event == "llm_task":
-                        logger.info(f"Received llm_task (task_id={payload.get('task_id')}), tools_payload={payload.get('tools')}")
-                        result = await self._handle_llm_task(payload, llm_client)
+                        logger.info(f"Received llm_task (task_id={payload.get('task_id')})")
+                        result = await self._handle_llm_task(payload)
                         logger.info(f"LLM result: status={result.get('status')}, sending back")
                         await self._send_result(ws, payload, result)
 
@@ -173,38 +173,42 @@ class Norns:
             finally:
                 heartbeat_task.cancel()
 
-    async def _handle_llm_task(self, task: dict, client: anthropic.Anthropic | None) -> dict:
-        """Execute an LLM call via the Anthropic API.
+    async def _handle_llm_task(self, task: dict) -> dict:
+        """Execute an LLM call via LiteLLM.
 
-        Receives provider-neutral format from Norns, translates to Anthropic,
-        calls the API, and translates the response back to neutral format.
+        Receives provider-neutral format from Norns, calls the LLM via LiteLLM
+        (which handles provider-specific translation), and returns the result
+        in neutral format.
         """
-        if client is None:
-            return {"status": "error", "error": "No LLM API key configured"}
-
         try:
-            model = task.get("model", "claude-sonnet-4-20250514")
+            raw_model = task.get("model", "claude-sonnet-4-20250514")
+            # LiteLLM expects provider/model format
+            if "/" not in raw_model:
+                model = f"{self._llm_provider}/{raw_model}"
+            else:
+                model = raw_model
             system_prompt = task.get("system_prompt", "")
             messages = task.get("messages", [])
             tools = task.get("tools", [])
 
+            # Prepend system prompt as a system message
+            llm_messages: list[dict] = []
+            if system_prompt:
+                llm_messages.append({"role": "system", "content": system_prompt})
+            llm_messages.extend(messages)
+
             kwargs: dict[str, Any] = {
                 "model": model,
                 "max_tokens": 4096,
-                "system": system_prompt,
-                "messages": _to_anthropic_messages(messages),
+                "messages": llm_messages,
             }
             if tools:
-                kwargs["tools"] = _to_anthropic_tools(tools)
+                kwargs["tools"] = _to_litellm_tools(tools)
 
             logger.info(f"LLM call: model={model}, tools={[t.get('name') for t in tools]}, msg_count={len(messages)}")
 
-            response = client.messages.create(**kwargs)
-            return _from_anthropic_response(response)
-
-        except anthropic.RateLimitError as e:
-            logger.warning(f"Rate limited, returning error to orchestrator: {e}")
-            return {"status": "error", "error": {"type": "rate_limit_error", "message": str(e)}}
+            response = await asyncio.to_thread(litellm.completion, **kwargs)
+            return _from_litellm_response(response)
 
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
@@ -545,112 +549,56 @@ def _parse_agent(data: dict) -> AgentResponse:
     )
 
 
-def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
-    """Translate neutral-format messages to Anthropic API format.
-
-    Neutral:
-      - assistant messages have optional "tool_calls" array with "arguments"
-      - tool results are role "tool" with "tool_call_id" and "name"
-    Anthropic:
-      - tool calls are content blocks with type "tool_use" and "input"
-      - tool results are content blocks inside user messages with type "tool_result"
-    """
-    anthropic_msgs: list[dict] = []
-
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        role = msg.get("role", "")
-
-        if role == "user":
-            anthropic_msgs.append({"role": "user", "content": msg.get("content", "")})
-
-        elif role == "assistant":
-            content_blocks: list[dict] = []
-            text = msg.get("content", "")
-            if text:
-                content_blocks.append({"type": "text", "text": text})
-
-            for tc in msg.get("tool_calls", []):
-                content_blocks.append({
-                    "type": "tool_use",
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "input": tc.get("arguments", {}),
-                })
-
-            if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
-                anthropic_msgs.append({"role": "assistant", "content": text})
-            else:
-                anthropic_msgs.append({"role": "assistant", "content": content_blocks})
-
-        elif role == "tool":
-            # Collect consecutive tool results into one user message
-            tool_results: list[dict] = []
-            while i < len(messages) and messages[i].get("role") == "tool":
-                t = messages[i]
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": t["tool_call_id"],
-                    "content": t.get("content", ""),
-                    **({"is_error": True} if t.get("is_error") else {}),
-                })
-                i += 1
-            anthropic_msgs.append({"role": "user", "content": tool_results})
-            continue  # skip the i += 1 at the bottom
-
-        i += 1
-
-    return anthropic_msgs
-
-
-def _to_anthropic_tools(tools: list[dict]) -> list[dict]:
-    """Translate neutral tool definitions to Anthropic format.
-
-    Neutral uses "parameters", Anthropic uses "input_schema".
-    """
+def _to_litellm_tools(tools: list[dict]) -> list[dict]:
+    """Translate neutral tool definitions to LiteLLM/OpenAI format."""
     return [
         {
-            "name": t["name"],
-            "description": t.get("description", ""),
-            "input_schema": t.get("parameters", {}),
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("parameters", {}),
+            },
         }
         for t in tools
     ]
 
 
-def _from_anthropic_response(response) -> dict:
-    """Translate an Anthropic API response to neutral wire format."""
-    text_parts: list[str] = []
+def _from_litellm_response(response) -> dict:
+    """Translate a LiteLLM response to Norns neutral wire format."""
+    choice = response.choices[0]
+    message = choice.message
+
+    content = message.content or ""
+
     tool_calls: list[dict] = []
+    if message.tool_calls:
+        for tc in message.tool_calls:
+            arguments = tc.function.arguments
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            tool_calls.append({
+                "id": tc.id,
+                "name": tc.function.name,
+                "arguments": arguments,
+            })
 
-    for block in response.content:
-        if hasattr(block, "type"):
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append({
-                    "id": block.id,
-                    "name": block.name,
-                    "arguments": block.input,
-                })
-
-    # Map Anthropic stop_reason to neutral finish_reason
-    stop_reason_map = {
-        "end_turn": "stop",
-        "tool_use": "tool_call",
-        "max_tokens": "length",
-        "stop_sequence": "stop",
+    # LiteLLM normalizes finish_reason to OpenAI values
+    finish_reason_map = {
+        "stop": "stop",
+        "tool_calls": "tool_call",
+        "length": "length",
+        "content_filter": "stop",
     }
-    finish_reason = stop_reason_map.get(response.stop_reason, response.stop_reason)
+    finish_reason = finish_reason_map.get(choice.finish_reason, choice.finish_reason)
 
     result: dict[str, Any] = {
         "status": "ok",
-        "content": "\n\n".join(text_parts),
+        "content": content,
         "finish_reason": finish_reason,
         "usage": {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
+            "input_tokens": response.usage.prompt_tokens,
+            "output_tokens": response.usage.completion_tokens,
         },
     }
     if tool_calls:

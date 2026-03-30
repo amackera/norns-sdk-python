@@ -125,14 +125,19 @@ class Agent:
     Usage:
         agent = Agent(
             name="support-bot",
-            model="claude-sonnet-4-20250514",
+            model="anthropic/claude-sonnet-4-20250514",
             system_prompt="You are a support agent.",
             tools=[my_tool],
         )
+
+    The model field is the model name as known to the LLM provider (e.g.
+    "claude-sonnet-4-20250514", "gpt-4o"). Set the llm_provider on the
+    Agent to tell the SDK which provider to use (defaults to "anthropic").
     """
 
     name: str
     model: str = "claude-sonnet-4-20250514"
+    llm_provider: str = "anthropic"
     system_prompt: str = ""
     tools: list[ToolDef] = field(default_factory=list)
     mode: str = "task"

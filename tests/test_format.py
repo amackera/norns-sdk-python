@@ -1,147 +1,57 @@
-"""Tests for neutral <-> Anthropic format translation."""
+"""Tests for neutral <-> LiteLLM format translation."""
 
-from norns.client import _to_anthropic_messages, _to_anthropic_tools, _from_anthropic_response
+import json
+from unittest.mock import MagicMock
 
-
-def test_simple_user_message():
-    msgs = _to_anthropic_messages([{"role": "user", "content": "Hello"}])
-    assert msgs == [{"role": "user", "content": "Hello"}]
+from norns.client import _to_litellm_tools, _from_litellm_response
 
 
-def test_simple_assistant_message():
-    msgs = _to_anthropic_messages([{"role": "assistant", "content": "Hi there"}])
-    assert msgs == [{"role": "assistant", "content": "Hi there"}]
-
-
-def test_assistant_with_tool_calls():
-    msgs = _to_anthropic_messages([{
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [
-            {"id": "tc_1", "name": "search", "arguments": {"query": "weather"}},
-        ],
-    }])
-    assert len(msgs) == 1
-    assert msgs[0]["role"] == "assistant"
-    blocks = msgs[0]["content"]
-    assert len(blocks) == 1
-    assert blocks[0]["type"] == "tool_use"
-    assert blocks[0]["id"] == "tc_1"
-    assert blocks[0]["name"] == "search"
-    assert blocks[0]["input"] == {"query": "weather"}
-
-
-def test_assistant_with_text_and_tool_calls():
-    msgs = _to_anthropic_messages([{
-        "role": "assistant",
-        "content": "Let me search for that.",
-        "tool_calls": [
-            {"id": "tc_1", "name": "search", "arguments": {"query": "weather"}},
-        ],
-    }])
-    blocks = msgs[0]["content"]
-    assert len(blocks) == 2
-    assert blocks[0] == {"type": "text", "text": "Let me search for that."}
-    assert blocks[1]["type"] == "tool_use"
-
-
-def test_tool_result_message():
-    msgs = _to_anthropic_messages([{
-        "role": "tool",
-        "tool_call_id": "tc_1",
-        "name": "search",
-        "content": "22°C, sunny",
-    }])
-    assert len(msgs) == 1
-    assert msgs[0]["role"] == "user"
-    blocks = msgs[0]["content"]
-    assert len(blocks) == 1
-    assert blocks[0]["type"] == "tool_result"
-    assert blocks[0]["tool_use_id"] == "tc_1"
-    assert blocks[0]["content"] == "22°C, sunny"
-
-
-def test_consecutive_tool_results_merged():
-    msgs = _to_anthropic_messages([
-        {"role": "tool", "tool_call_id": "tc_1", "name": "a", "content": "result1"},
-        {"role": "tool", "tool_call_id": "tc_2", "name": "b", "content": "result2"},
-    ])
-    assert len(msgs) == 1
-    assert msgs[0]["role"] == "user"
-    blocks = msgs[0]["content"]
-    assert len(blocks) == 2
-
-
-def test_tool_result_with_error():
-    msgs = _to_anthropic_messages([{
-        "role": "tool",
-        "tool_call_id": "tc_1",
-        "name": "search",
-        "content": "not found",
-        "is_error": True,
-    }])
-    block = msgs[0]["content"][0]
-    assert block["is_error"] is True
-
-
-def test_full_conversation():
-    neutral = [
-        {"role": "user", "content": "What's the weather?"},
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "tc_1", "name": "get_weather", "arguments": {"city": "Toronto"}},
-        ]},
-        {"role": "tool", "tool_call_id": "tc_1", "name": "get_weather", "content": "22°C"},
-        {"role": "assistant", "content": "It's 22°C in Toronto."},
-    ]
-    result = _to_anthropic_messages(neutral)
-    assert len(result) == 4
-    assert result[0] == {"role": "user", "content": "What's the weather?"}
-    assert result[1]["role"] == "assistant"
-    assert result[1]["content"][0]["type"] == "tool_use"
-    assert result[2]["role"] == "user"
-    assert result[2]["content"][0]["type"] == "tool_result"
-    assert result[3] == {"role": "assistant", "content": "It's 22°C in Toronto."}
-
-
-def test_to_anthropic_tools():
-    tools = _to_anthropic_tools([{
+def test_to_litellm_tools():
+    tools = _to_litellm_tools([{
         "name": "search",
         "description": "Search the web",
         "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
     }])
     assert len(tools) == 1
-    assert tools[0]["name"] == "search"
-    assert tools[0]["input_schema"] == {"type": "object", "properties": {"q": {"type": "string"}}}
-    assert "parameters" not in tools[0]
+    assert tools[0]["type"] == "function"
+    assert tools[0]["function"]["name"] == "search"
+    assert tools[0]["function"]["parameters"] == {"type": "object", "properties": {"q": {"type": "string"}}}
 
 
-class FakeBlock:
-    def __init__(self, type, **kwargs):
-        self.type = type
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+def test_to_litellm_tools_multiple():
+    tools = _to_litellm_tools([
+        {"name": "a", "description": "Tool A", "parameters": {}},
+        {"name": "b", "description": "Tool B", "parameters": {}},
+    ])
+    assert len(tools) == 2
+    assert tools[0]["function"]["name"] == "a"
+    assert tools[1]["function"]["name"] == "b"
 
 
-class FakeUsage:
-    def __init__(self, input_tokens, output_tokens):
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
+def _make_response(content="Hello!", finish_reason="stop", tool_calls=None,
+                   prompt_tokens=100, completion_tokens=20):
+    """Build a mock LiteLLM response."""
+    message = MagicMock()
+    message.content = content
+    message.tool_calls = tool_calls
+
+    choice = MagicMock()
+    choice.message = message
+    choice.finish_reason = finish_reason
+
+    usage = MagicMock()
+    usage.prompt_tokens = prompt_tokens
+    usage.completion_tokens = completion_tokens
+
+    response = MagicMock()
+    response.choices = [choice]
+    response.usage = usage
+    return response
 
 
-class FakeResponse:
-    def __init__(self, content, stop_reason, usage):
-        self.content = content
-        self.stop_reason = stop_reason
-        self.usage = usage
-
-
-def test_from_anthropic_text_response():
-    resp = FakeResponse(
-        content=[FakeBlock("text", text="Hello!")],
-        stop_reason="end_turn",
-        usage=FakeUsage(100, 20),
-    )
-    result = _from_anthropic_response(resp)
+def test_from_litellm_text_response():
+    resp = _make_response(content="Hello!", finish_reason="stop")
+    result = _from_litellm_response(resp)
     assert result["status"] == "ok"
     assert result["content"] == "Hello!"
     assert result["finish_reason"] == "stop"
@@ -149,16 +59,14 @@ def test_from_anthropic_text_response():
     assert "tool_calls" not in result
 
 
-def test_from_anthropic_tool_call_response():
-    resp = FakeResponse(
-        content=[
-            FakeBlock("text", text="Let me check."),
-            FakeBlock("tool_use", id="tc_1", name="search", input={"q": "weather"}),
-        ],
-        stop_reason="tool_use",
-        usage=FakeUsage(150, 30),
-    )
-    result = _from_anthropic_response(resp)
+def test_from_litellm_tool_call_response():
+    tc = MagicMock()
+    tc.id = "tc_1"
+    tc.function.name = "search"
+    tc.function.arguments = json.dumps({"q": "weather"})
+
+    resp = _make_response(content="Let me check.", finish_reason="tool_calls", tool_calls=[tc])
+    result = _from_litellm_response(resp)
     assert result["content"] == "Let me check."
     assert result["finish_reason"] == "tool_call"
     assert len(result["tool_calls"]) == 1
@@ -169,11 +77,43 @@ def test_from_anthropic_tool_call_response():
     }
 
 
-def test_from_anthropic_max_tokens():
-    resp = FakeResponse(
-        content=[FakeBlock("text", text="Truncated...")],
-        stop_reason="max_tokens",
-        usage=FakeUsage(100, 4096),
-    )
-    result = _from_anthropic_response(resp)
+def test_from_litellm_tool_call_dict_arguments():
+    """LiteLLM sometimes returns arguments as dict instead of JSON string."""
+    tc = MagicMock()
+    tc.id = "tc_1"
+    tc.function.name = "search"
+    tc.function.arguments = {"q": "weather"}
+
+    resp = _make_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+    result = _from_litellm_response(resp)
+    assert result["tool_calls"][0]["arguments"] == {"q": "weather"}
+
+
+def test_from_litellm_length_finish():
+    resp = _make_response(content="Truncated...", finish_reason="length")
+    result = _from_litellm_response(resp)
     assert result["finish_reason"] == "length"
+
+
+def test_from_litellm_none_content():
+    resp = _make_response(content=None, finish_reason="stop")
+    result = _from_litellm_response(resp)
+    assert result["content"] == ""
+
+
+def test_from_litellm_multiple_tool_calls():
+    tc1 = MagicMock()
+    tc1.id = "tc_1"
+    tc1.function.name = "search"
+    tc1.function.arguments = json.dumps({"q": "a"})
+
+    tc2 = MagicMock()
+    tc2.id = "tc_2"
+    tc2.function.name = "lookup"
+    tc2.function.arguments = json.dumps({"id": "123"})
+
+    resp = _make_response(content="", finish_reason="tool_calls", tool_calls=[tc1, tc2])
+    result = _from_litellm_response(resp)
+    assert len(result["tool_calls"]) == 2
+    assert result["tool_calls"][0]["name"] == "search"
+    assert result["tool_calls"][1]["name"] == "lookup"

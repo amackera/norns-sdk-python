@@ -91,7 +91,7 @@ def test_send_message_and_complete(client):
     # Start worker in background thread
     def run_worker():
         try:
-            worker.run(agent_def, llm_api_key=ANTHROPIC_API_KEY)
+            worker.run(agent_def)
         except Exception:
             pass
 

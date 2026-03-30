@@ -43,16 +43,16 @@ agent = Agent(
 )
 
 norns = Norns("http://localhost:4000", api_key=os.environ["NORNS_API_KEY"])
-norns.run(agent, llm_api_key=os.environ["ANTHROPIC_API_KEY"])
+norns.run(agent)  # LLM API keys read from env (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
 ```
 
-This connects to Norns via WebSocket, registers the agent, and sits in a loop handling `llm_task` and `tool_task` dispatches. Norns never sees your API keys — your worker makes all external calls.
+This connects to Norns via WebSocket, registers the agent, and sits in a loop handling `llm_task` and `tool_task` dispatches. LLM calls are routed through [LiteLLM](https://github.com/BerriAI/litellm), so any supported provider works. Norns never sees your API keys — your worker makes all external calls.
 
 ```
 Norns Orchestrator                    Your Python Worker
   │  (pure state machine)                │  (this SDK)
   │                                      │
-  │  dispatches llm_task ──────────────► │  calls Anthropic API
+  │  dispatches llm_task ──────────────► │  calls LLM (via LiteLLM)
   │  ◄── llm_response ─────────────────  │
   │  dispatches tool_task ─────────────► │  calls search_docs()
   │  ◄── tool_result ──────────────────  │
