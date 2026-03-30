@@ -64,8 +64,27 @@ class Norns:
         asyncio.run(self._run_loop(agent, wid))
 
     def _ensure_agent(self, agent: Agent):
-        """Create the agent via REST API if it doesn't already exist."""
+        """Create or update the agent via REST API.
+
+        If the agent already exists, updates it to match the current definition.
+        This ensures code changes (system_prompt, model, etc.) are always picked up.
+        """
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        body = {
+            "name": agent.name,
+            "system_prompt": agent.system_prompt,
+            "status": "idle",
+            "model": agent.model,
+            "max_steps": agent.max_steps,
+            "model_config": {
+                "mode": agent.mode,
+                "checkpoint_policy": agent.checkpoint_policy,
+                "context_strategy": agent.context_strategy,
+                "context_window": agent.context_window,
+                "on_failure": agent.on_failure,
+            },
+        }
+
         with httpx.Client(base_url=self.url, headers=headers) as client:
             resp = client.get("/api/v1/agents")
             resp.raise_for_status()
@@ -73,23 +92,11 @@ class Norns:
 
             for a in existing:
                 if a["name"] == agent.name:
-                    logger.info(f"Agent '{agent.name}' already exists (id={a['id']})")
+                    resp = client.put(f"/api/v1/agents/{a['id']}", json=body)
+                    resp.raise_for_status()
+                    logger.info(f"Updated agent '{agent.name}' (id={a['id']})")
                     return
 
-            body = {
-                "name": agent.name,
-                "system_prompt": agent.system_prompt,
-                "status": "idle",
-                "model": agent.model,
-                "max_steps": agent.max_steps,
-                "model_config": {
-                    "mode": agent.mode,
-                    "checkpoint_policy": agent.checkpoint_policy,
-                    "context_strategy": agent.context_strategy,
-                    "context_window": agent.context_window,
-                    "on_failure": agent.on_failure,
-                },
-            }
             resp = client.post("/api/v1/agents", json=body)
             resp.raise_for_status()
             created = resp.json()["data"]
@@ -195,7 +202,7 @@ class Norns:
             llm_messages: list[dict] = []
             if system_prompt:
                 llm_messages.append({"role": "system", "content": system_prompt})
-            llm_messages.extend(messages)
+            llm_messages.extend(_to_litellm_messages(messages))
 
             kwargs: dict[str, Any] = {
                 "model": model,
@@ -547,6 +554,41 @@ def _parse_agent(data: dict) -> AgentResponse:
         system_prompt=data.get("system_prompt", ""),
         max_steps=data.get("max_steps", 50),
     )
+
+
+def _to_litellm_messages(messages: list[dict]) -> list[dict]:
+    """Translate neutral-format messages to LiteLLM/OpenAI format.
+
+    Neutral format tool_calls use {id, name, arguments (object)}.
+    OpenAI format expects {id, type: "function", function: {name, arguments (JSON string)}}.
+    """
+    result = []
+    for msg in messages:
+        role = msg.get("role", "")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            converted_calls = []
+            for tc in msg["tool_calls"]:
+                args = tc.get("arguments", {})
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+                converted_calls.append({
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": args,
+                    },
+                })
+            result.append({
+                "role": "assistant",
+                "content": msg.get("content", "") or None,
+                "tool_calls": converted_calls,
+            })
+        else:
+            result.append(msg)
+
+    return result
 
 
 def _to_litellm_tools(tools: list[dict]) -> list[dict]:
