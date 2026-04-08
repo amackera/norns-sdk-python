@@ -57,11 +57,19 @@ class Norns:
         (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.). The llm_api_key
         parameter is accepted for backwards compatibility but ignored.
         """
+        # Suppress noisy LiteLLM logs
+        logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+        logging.getLogger("litellm").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
         self._ensure_agent(agent)
 
         wid = worker_id or f"python-worker-{uuid.uuid4().hex[:8]}"
 
-        asyncio.run(self._run_loop(agent, wid))
+        try:
+            asyncio.run(self._run_loop(agent, wid))
+        except KeyboardInterrupt:
+            logger.info("Worker shutting down.")
 
     def _ensure_agent(self, agent: Agent):
         """Create or update the agent via REST API.
@@ -143,7 +151,7 @@ class Norns:
 
             response = await ws.recv()
             resp_data = json.loads(response)
-            logger.info(f"Joined worker:lobby as {worker_id}")
+            logger.info(f"Worker {worker_id} ready")
 
             # Heartbeat task
             heartbeat_task = asyncio.create_task(self._heartbeat(ws))
@@ -158,15 +166,20 @@ class Norns:
                     _join_ref, _ref, _topic, event, payload = msg
 
                     if event == "llm_task":
-                        logger.info(f"Received llm_task (task_id={payload.get('task_id')})")
+                        tools_list = [t.get("name") for t in payload.get("tools", [])]
+                        logger.info(f"LLM call → {payload.get('model', '?')} ({len(payload.get('messages', []))} messages, {len(tools_list)} tools)")
                         result = await self._handle_llm_task(payload)
-                        logger.info(f"LLM result: status={result.get('status')}, sending back")
+                        finish = result.get("finish_reason", result.get("status", "?"))
+                        logger.info(f"LLM done → {finish}")
                         await self._send_result(ws, payload, result)
 
                     elif event == "tool_task":
-                        logger.info(f"Received tool_task: {payload.get('tool_name')} (task_id={payload.get('task_id')})")
+                        tool_name = payload.get("tool_name", "?")
+                        logger.info(f"Tool call → {tool_name}")
                         result = await self._handle_tool_task(payload, tools_by_name)
-                        logger.info(f"Tool result: status={result.get('status')}, sending back")
+                        status = result.get("status", "?")
+                        preview = str(result.get("result", result.get("error", "")))[:80]
+                        logger.info(f"Tool done → {tool_name}: {status} {preview}")
                         await self._send_result(ws, payload, result)
 
                     elif event == "phx_error":
@@ -212,13 +225,11 @@ class Norns:
             if tools:
                 kwargs["tools"] = _to_litellm_tools(tools)
 
-            logger.info(f"LLM call: model={model}, tools={[t.get('name') for t in tools]}, msg_count={len(messages)}")
-
             response = await asyncio.to_thread(litellm.completion, **kwargs)
             return _from_litellm_response(response)
 
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
+            logger.error(f"LLM error: {e}")
             return {"status": "error", "error": str(e)}
 
     async def _handle_tool_task(self, task: dict, tools: dict[str, ToolDef]) -> dict:
@@ -584,6 +595,13 @@ def _to_litellm_messages(messages: list[dict]) -> list[dict]:
                 "role": "assistant",
                 "content": msg.get("content", "") or None,
                 "tool_calls": converted_calls,
+            })
+        elif role == "tool":
+            # Ensure tool results have the right field name for LiteLLM
+            result.append({
+                "role": "tool",
+                "tool_call_id": msg.get("tool_call_id", msg.get("id", "")),
+                "content": msg.get("content", ""),
             })
         else:
             result.append(msg)
