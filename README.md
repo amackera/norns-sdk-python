@@ -92,7 +92,7 @@ for event in client.stream("support-bot", "Research quantum computing"):
 
 ## Tools
 
-The `@tool` decorator infers JSON Schema from type hints:
+The `@tool` decorator infers JSON Schema from type hints. The docstring becomes the tool description the LLM sees.
 
 ```python
 @tool
