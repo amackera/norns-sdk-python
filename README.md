@@ -1,11 +1,11 @@
 # norns-sdk
 
-[![CI](https://github.com/amackera/norns-sdk-python/actions/workflows/ci.yml/badge.svg)](https://github.com/amackera/norns-sdk-python/actions/workflows/ci.yml)
+[![CI](https://github.com/nornscode/norns-sdk-python/actions/workflows/ci.yml/badge.svg)](https://github.com/nornscode/norns-sdk-python/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/norns-sdk)](https://pypi.org/project/norns-sdk/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Python SDK for [Norns](https://github.com/amackera/norns) — durable agent runtime on BEAM.
+Python SDK for [Norns](https://github.com/nornscode/norns) — durable agent runtime on BEAM.
 
 Two classes, two roles:
 
