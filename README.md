@@ -5,16 +5,13 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Python SDK for [Norns](https://github.com/nornscode/norns) — durable agent runtime on BEAM.
-
-Two classes, two roles:
-
-- **`Norns`** — worker. Registers agents and tools, handles dispatched LLM/tool tasks. Blocks forever, like a Temporal worker.
-- **`NornsClient`** — client. Sends messages, polls for results, streams events. For your Slack bot, web backend, CLI, etc.
+Python SDK for [Norns](https://github.com/nornscode/norns).
 
 ```bash
 pip install norns-sdk
 ```
+
+The SDK has two parts. `Norns` is the worker — it connects to the server, registers your agent, and sits in a loop handling tasks. `NornsClient` is for sending messages and reading results from application code (your Slack bot, web backend, CLI, etc).
 
 ## Worker
 
@@ -46,18 +43,7 @@ norns = Norns("http://localhost:4000", api_key=os.environ["NORNS_API_KEY"])
 norns.run(agent)  # LLM API keys read from env (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
 ```
 
-This connects to Norns via WebSocket, registers the agent, and sits in a loop handling `llm_task` and `tool_task` dispatches. LLM calls are routed through [LiteLLM](https://github.com/BerriAI/litellm), so any supported provider works. Norns never sees your API keys — your worker makes all external calls.
-
-```
-Norns Orchestrator                    Your Python Worker
-  │  (pure state machine)                │  (this SDK)
-  │                                      │
-  │  dispatches llm_task ──────────────► │  calls LLM (via LiteLLM)
-  │  ◄── llm_response ─────────────────  │
-  │  dispatches tool_task ─────────────► │  calls search_docs()
-  │  ◄── tool_result ──────────────────  │
-  │  logs events, checkpoints            │
-```
+`norns.run()` connects via WebSocket, registers the agent and tools, then blocks forever handling `llm_task` and `tool_task` dispatches. LLM calls go through [LiteLLM](https://github.com/BerriAI/litellm), so any supported provider works. Norns never sees your API keys — your worker makes all external calls.
 
 ## Client
 
@@ -102,7 +88,7 @@ def lookup_customer(email: str) -> str:
     return f"Found: {customer['name']} ({customer['plan']})"
 ```
 
-Mark side-effecting tools so Norns can enforce idempotency:
+Mark side-effecting tools so Norns can enforce idempotency on replay:
 
 ```python
 @tool(side_effect=True)
