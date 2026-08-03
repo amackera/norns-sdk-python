@@ -23,6 +23,7 @@ from norns.models import (
     MessageResult,
     RunResponse,
     StreamEvent,
+    WaitingFor,
 )
 
 logger = logging.getLogger("norns")
@@ -384,17 +385,20 @@ class NornsClient:
                 conversation_key=conversation_key,
             )
 
-        # Poll until completion or timeout
+        # Poll until the run stops progressing, or we time out.
+        # "waiting" is not terminal, but the agent is parked on a question and
+        # won't move until someone answers — so it stops the wait too.
         deadline = time.monotonic() + timeout
         poll_interval = 0.5
         while time.monotonic() < deadline:
             run = self.get_run(run_id)
-            if run.status in ("completed", "failed", "error"):
+            if run.status in ("completed", "failed", "error", "waiting"):
                 return MessageResult(
                     run_id=run_id,
                     status=run.status,
                     output=run.output,
                     conversation_key=conversation_key,
+                    waiting_for=run.waiting_for,
                 )
             time.sleep(poll_interval)
             poll_interval = min(poll_interval * 1.5, 3.0)
@@ -415,7 +419,24 @@ class NornsClient:
             conversation_id=data.get("conversation_id"),
             trigger_type=data.get("trigger_type", "message"),
             inserted_at=data["inserted_at"],
+            waiting_for=WaitingFor.from_dict(data.get("waiting_for")),
         )
+
+    def reply(self, run_id: int, answer: str) -> None:
+        """Answer a run parked on an ``ask_human`` question.
+
+        Sending the agent a normal message with ``send_message()`` does the
+        same thing and is usually what a conversational client wants. Use
+        ``reply()`` to answer one specific run — for example when an agent has
+        several conversations parked at once.
+
+        Example:
+            result = client.send_message("support-bot", "Book it", wait=True)
+            if result.is_waiting:
+                print(result.waiting_for.question)
+                client.reply(result.run_id, "yes, go ahead")
+        """
+        self._request("POST", f"/api/v1/runs/{run_id}/reply", json={"answer": answer})
 
     def get_events(self, run_id: int) -> list[EventResponse]:
         """Get the event log for a run."""

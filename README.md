@@ -76,6 +76,20 @@ for event in client.stream("support-bot", "Research quantum computing"):
         break
 ```
 
+## Human-in-the-loop
+
+An agent can call the built-in `ask_human` tool to pause and ask a question. The run parks with status `"waiting"` until someone answers, and survives a restart while parked.
+
+```python
+result = client.send_message("support-bot", "Book me a table", wait=True)
+
+if result.is_waiting:
+    print(result.waiting_for.question)      # "7pm or 8pm?"
+    client.reply(result.run_id, "7pm")
+```
+
+`wait=True` returns as soon as the agent parks — it's waiting on you, so it won't progress on its own. Sending the agent another message answers the question too, which is usually what a chat or Slack client wants; `reply()` targets one specific run.
+
 ## Tools
 
 The `@tool` decorator infers JSON Schema from type hints. The docstring becomes the tool description the LLM sees.

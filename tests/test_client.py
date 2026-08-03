@@ -1,5 +1,7 @@
 """Tests for NornsClient."""
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -173,6 +175,71 @@ def test_get_run(client):
     assert run.run_id == 42
     assert run.status == "completed"
     assert run.output == "Done"
+
+
+@respx.mock
+def test_get_run_parses_waiting_for(client):
+    respx.get(f"{BASE_URL}/api/v1/runs/43").mock(
+        return_value=httpx.Response(200, json={"data": {
+            "id": 43, "status": "waiting", "output": None,
+            "agent_id": 1, "conversation_id": 5, "trigger_type": "message",
+            "inserted_at": "2025-01-01T00:00:00Z",
+            "waiting_for": {
+                "question": "Book the 7pm show?",
+                "tool_call_id": "call_ask",
+                "asked_at": "2025-01-01T00:00:00Z",
+            },
+        }})
+    )
+    run = client.get_run(43)
+    assert run.is_waiting
+    assert run.waiting_for.question == "Book the 7pm show?"
+    assert run.waiting_for.tool_call_id == "call_ask"
+
+
+@respx.mock
+def test_get_run_without_waiting_for(client):
+    respx.get(f"{BASE_URL}/api/v1/runs/44").mock(
+        return_value=httpx.Response(200, json={"data": {
+            "id": 44, "status": "running", "output": None,
+            "agent_id": 1, "conversation_id": None, "trigger_type": "message",
+            "inserted_at": "2025-01-01T00:00:00Z",
+        }})
+    )
+    run = client.get_run(44)
+    assert run.waiting_for is None
+    assert not run.is_waiting
+
+
+@respx.mock
+def test_send_message_wait_stops_on_waiting(client):
+    """A parked agent is waiting on the caller — don't poll until timeout."""
+    respx.post(f"{BASE_URL}/api/v1/agents/1/messages").mock(
+        return_value=httpx.Response(202, json={"run_id": 45, "status": "accepted"})
+    )
+    respx.get(f"{BASE_URL}/api/v1/runs/45").mock(
+        return_value=httpx.Response(200, json={"data": {
+            "id": 45, "status": "waiting", "output": None,
+            "agent_id": 1, "conversation_id": None, "trigger_type": "message",
+            "inserted_at": "2025-01-01T00:00:00Z",
+            "waiting_for": {"question": "7pm or 8pm?", "tool_call_id": "call_ask"},
+        }})
+    )
+
+    result = client.send_message(1, "Book me a table", wait=True, timeout=5)
+    assert result.is_waiting
+    assert result.status == "waiting"
+    assert result.waiting_for.question == "7pm or 8pm?"
+
+
+@respx.mock
+def test_reply(client):
+    route = respx.post(f"{BASE_URL}/api/v1/runs/45/reply").mock(
+        return_value=httpx.Response(202, json={"status": "accepted", "run_id": 45})
+    )
+    client.reply(45, "7pm")
+    assert route.called
+    assert json.loads(route.calls[0].request.content) == {"answer": "7pm"}
 
 
 @respx.mock

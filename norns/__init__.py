@@ -9,6 +9,7 @@ from norns.models import (
     MessageResult,
     RunResponse,
     StreamEvent,
+    WaitingFor,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "MessageResult",
     "RunResponse",
     "StreamEvent",
+    "WaitingFor",
 ]
