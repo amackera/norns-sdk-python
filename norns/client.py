@@ -202,7 +202,7 @@ class Norns:
         in neutral format.
         """
         try:
-            raw_model = task.get("model", "claude-sonnet-4-20250514")
+            raw_model = task.get("model", "claude-sonnet-5")
             # LiteLLM expects provider/model format
             if "/" not in raw_model:
                 model = f"{self._llm_provider}/{raw_model}"

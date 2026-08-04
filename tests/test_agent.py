@@ -72,7 +72,7 @@ def test_tool_registration_format():
 
 def test_agent_defaults():
     agent = Agent(name="test")
-    assert agent.model == "claude-sonnet-4-20250514"
+    assert agent.model == "claude-sonnet-5"
     assert agent.mode == "task"
     assert agent.on_failure == "retry_last_step"
     assert agent.max_steps == 50

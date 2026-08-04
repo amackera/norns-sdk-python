@@ -32,7 +32,7 @@ def send_email(to: str, subject: str, body: str) -> str:
 
 agent = Agent(
     name="support-bot",
-    model="claude-sonnet-4-20250514",
+    model="claude-sonnet-5",
     system_prompt="You are a customer support agent. Look up docs and help customers.",
     tools=[search_docs, send_email],
     mode="conversation",
@@ -128,7 +128,7 @@ async def fetch_page(url: str) -> str:
 ```python
 agent = Agent(
     name="my-agent",
-    model="claude-sonnet-4-20250514",
+    model="claude-sonnet-5",
     system_prompt="You are helpful.",
     tools=[search, send_email],
     mode="conversation",             # "task" or "conversation"
