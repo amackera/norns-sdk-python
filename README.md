@@ -45,6 +45,22 @@ norns.run(agent)  # LLM API keys read from env (ANTHROPIC_API_KEY, OPENAI_API_KE
 
 `norns.run()` connects via WebSocket, registers the agent and tools, then blocks forever handling `llm_task` and `tool_task` dispatches. LLM calls go through [LiteLLM](https://github.com/BerriAI/litellm), so any supported provider works. Norns never sees your API keys — your worker makes all external calls.
 
+### Gards
+
+A [gard](https://github.com/nornscode/norns/blob/main/docs/gards.md) pins all of a run's tool dispatch to one worker — worker affinity for coding agents and other filesystem-bound work. Create one (`nornsctl gards create` prints the claim token once), then claim it:
+
+```python
+norns.run(agent, gard=3, claim_token="tok_...")
+```
+
+A worker in a gard serves only runs bound to that gard, and vice versa. Tool handlers can expose service ports for the dashboard — the gard is inferred from the connection:
+
+```python
+norns.register_port(3000, name="react", url="http://localhost:3000")
+```
+
+A fatally rejected claim (bad token, destroyed gard) raises `JoinError` instead of reconnect-looping; `GardDestroyed` is raised if the gard is destroyed while the worker is connected.
+
 ## Client
 
 ```python

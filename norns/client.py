@@ -29,6 +29,20 @@ from norns.models import (
 logger = logging.getLogger("norns")
 
 
+class JoinError(Exception):
+    """The worker channel join was rejected for a non-retryable reason
+    (invalid claim token, destroyed or missing gard, bad registration)."""
+
+
+class JoinRetryable(Exception):
+    """The join failed for a reason a reconnect can fix (e.g. the previous
+    incarnation's disconnect hasn't been processed yet)."""
+
+
+class GardDestroyed(Exception):
+    """The gard this worker claimed was destroyed while it was connected."""
+
+
 class Norns:
     """Client for the Norns durable agent runtime.
 
@@ -47,12 +61,29 @@ class Norns:
         self.url = url.rstrip("/")
         self.api_key = api_key or os.environ.get("NORNS_API_KEY", "")
         self._ws_url = self.url.replace("http://", "ws://").replace("https://", "wss://")
+        self._gard: str | int | None = None
+        self._claim_token: str | None = None
+        self._ws = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    def run(self, agent: Agent, *, llm_api_key: str | None = None, worker_id: str | None = None):
+    def run(
+        self,
+        agent: Agent,
+        *,
+        llm_api_key: str | None = None,
+        worker_id: str | None = None,
+        gard: str | int | None = None,
+        claim_token: str | None = None,
+    ):
         """Connect as a worker, register the agent, and handle tasks forever.
 
         Auto-creates the agent via REST if it doesn't exist yet.
         This blocks — like a Temporal worker.
+
+        Pass gard and claim_token (both from POST /api/v1/gards, usually
+        handed to the worker by the provisioner) to claim a gard: all tool
+        dispatch for runs bound to that gard comes to this worker, and only
+        to it. A worker without a gard only serves no-gard runs.
 
         LLM API keys are read from environment variables by LiteLLM
         (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.). The llm_api_key
@@ -64,6 +95,8 @@ class Norns:
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         self._ensure_agent(agent)
+        self._gard = gard
+        self._claim_token = claim_token
 
         wid = worker_id or f"python-worker-{uuid.uuid4().hex[:8]}"
 
@@ -71,6 +104,36 @@ class Norns:
             asyncio.run(self._run_loop(agent, wid))
         except KeyboardInterrupt:
             logger.info("Worker shutting down.")
+
+    def register_port(
+        self,
+        internal_port: int,
+        *,
+        name: str = "",
+        url: str | None = None,
+        protocol: str = "http",
+    ):
+        """Register a service port with Norns for dashboard visibility.
+
+        Requires the worker to be running in a gard — the gard is inferred
+        from the connection, so there's nothing to re-specify here. Call this
+        from a (sync) tool handler after starting a service; it's
+        best-effort, and a rejected registration (e.g. a disallowed URL
+        scheme) is logged by the message loop rather than raised.
+        """
+        if self._gard is None:
+            raise RuntimeError("register_port requires the worker to be running in a gard")
+        if self._ws is None or self._loop is None:
+            raise RuntimeError("register_port requires a connected worker (call from a tool handler)")
+
+        payload = {"internal_port": internal_port, "name": name, "protocol": protocol}
+        if url:
+            payload["url"] = url
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._push("register_port", payload), self._loop
+        )
+        future.result(timeout=10)
 
     def _ensure_agent(self, agent: Agent):
         """Create or update the agent via REST API.
@@ -119,12 +182,32 @@ class Norns:
         while True:
             try:
                 await self._connect_and_serve(agent, worker_id, tools_by_name)
+            except (JoinError, GardDestroyed):
+                # Retrying can never succeed — surface it instead of spinning.
+                raise
+            except JoinRetryable as e:
+                logger.warning(f"{e}. Retrying in 3s...")
+                await asyncio.sleep(3)
             except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
                 logger.warning(f"Connection lost: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
             except Exception as e:
                 logger.error(f"Unexpected error: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
+
+    def _join_payload(self, agent: Agent, worker_id: str) -> dict:
+        payload = {
+            "worker_id": worker_id,
+            "tools": [t.to_registration() for t in agent.tools],
+            "capabilities": ["llm", "tools"],
+            "agents": [agent.to_registration()],
+        }
+
+        if self._gard is not None:
+            payload["gard"] = self._gard
+            payload["claim_token"] = self._claim_token
+
+        return payload
 
     async def _connect_and_serve(
         self,
@@ -140,19 +223,22 @@ class Norns:
             self._ref_counter = 1
 
             # Phoenix channel join
-            join_payload = {
-                "worker_id": worker_id,
-                "tools": [t.to_registration() for t in agent.tools],
-                "capabilities": ["llm", "tools"],
-                "agents": [agent.to_registration()],
-            }
-
-            join_msg = json.dumps([None, "1", "worker:lobby", "phx_join", join_payload])
+            join_msg = json.dumps(
+                [None, "1", "worker:lobby", "phx_join", self._join_payload(agent, worker_id)]
+            )
             await ws.send(join_msg)
 
             response = await ws.recv()
             resp_data = json.loads(response)
-            logger.info(f"Worker {worker_id} ready")
+            self._check_join_reply(resp_data)
+
+            if self._gard is not None:
+                logger.info(f"Worker {worker_id} ready (gard {self._gard})")
+            else:
+                logger.info(f"Worker {worker_id} ready")
+
+            self._ws = ws
+            self._loop = asyncio.get_running_loop()
 
             # Heartbeat task
             heartbeat_task = asyncio.create_task(self._heartbeat(ws))
@@ -183,6 +269,14 @@ class Norns:
                         logger.info(f"Tool done → {tool_name}: {status} {preview}")
                         await self._send_result(ws, payload, result)
 
+                    elif event == "phx_reply" and isinstance(payload, dict) and payload.get("status") == "error":
+                        # e.g. a rejected register_port — surface it, don't die
+                        logger.warning(f"Server rejected a push: {payload.get('response')}")
+
+                    elif event == "gard_destroyed":
+                        logger.error("This worker's gard was destroyed — shutting down")
+                        raise GardDestroyed(f"gard {self._gard} was destroyed")
+
                     elif event == "phx_error":
                         logger.error(f"Channel error: {payload}")
                         break
@@ -192,7 +286,37 @@ class Norns:
                         break
 
             finally:
+                self._ws = None
                 heartbeat_task.cancel()
+
+    def _check_join_reply(self, msg):
+        """Raise on a failed channel join instead of pretending we're ready.
+
+        A gard claim rejection arrives here. `already_claimed` is retryable —
+        on a quick reconnect, the server may not have processed the old
+        connection's disconnect yet. Everything else (bad token, destroyed or
+        missing gard) is fatal: retrying can never succeed.
+        """
+        if not isinstance(msg, list) or len(msg) < 5:
+            return
+
+        payload = msg[4]
+        if not isinstance(payload, dict) or payload.get("status") != "error":
+            return
+
+        response = payload.get("response") or {}
+        reason = response.get("reason", "join rejected")
+
+        if reason == "already_claimed":
+            raise JoinRetryable(f"gard claim: {reason}")
+
+        raise JoinError(f"worker join rejected: {reason}")
+
+    async def _push(self, event: str, payload: dict):
+        """Send a channel push on the active connection."""
+        self._ref_counter += 1
+        msg = json.dumps(["1", str(self._ref_counter), "worker:lobby", event, payload])
+        await self._ws.send(msg)
 
     async def _handle_llm_task(self, task: dict) -> dict:
         """Execute an LLM call via LiteLLM.
