@@ -98,7 +98,14 @@ class Norns:
         self._gard = gard
         self._claim_token = claim_token
 
-        wid = worker_id or f"python-worker-{uuid.uuid4().hex[:8]}"
+        # NORNS_WORKER_ID lets a provisioner give the worker a stable
+        # identity (volund sets it to the deployment name) so operators
+        # can join "container running" with "worker connected".
+        wid = (
+            worker_id
+            or os.environ.get("NORNS_WORKER_ID")
+            or f"python-worker-{uuid.uuid4().hex[:8]}"
+        )
 
         try:
             asyncio.run(self._run_loop(agent, wid))
