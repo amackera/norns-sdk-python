@@ -250,6 +250,17 @@ class Norns:
             # Heartbeat task
             heartbeat_task = asyncio.create_task(self._heartbeat(ws))
 
+            # Each task runs as its own asyncio task: a slow tool or LLM
+            # call must not block the receive loop, or every other task on
+            # this connection (parallel tool calls, other runs) serializes
+            # behind it.
+            in_flight: set[asyncio.Task] = set()
+
+            def spawn(coro):
+                task = asyncio.create_task(coro)
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
+
             try:
                 async for raw_msg in ws:
                     msg = json.loads(raw_msg)
@@ -260,21 +271,10 @@ class Norns:
                     _join_ref, _ref, _topic, event, payload = msg
 
                     if event == "llm_task":
-                        tools_list = [t.get("name") for t in payload.get("tools", [])]
-                        logger.info(f"LLM call → {payload.get('model', '?')} ({len(payload.get('messages', []))} messages, {len(tools_list)} tools)")
-                        result = await self._handle_llm_task(payload)
-                        finish = result.get("finish_reason", result.get("status", "?"))
-                        logger.info(f"LLM done → {finish}")
-                        await self._send_result(ws, payload, result)
+                        spawn(self._run_llm_task(ws, payload))
 
                     elif event == "tool_task":
-                        tool_name = payload.get("tool_name", "?")
-                        logger.info(f"Tool call → {tool_name}")
-                        result = await self._handle_tool_task(payload, tools_by_name)
-                        status = result.get("status", "?")
-                        preview = str(result.get("result", result.get("error", "")))[:80]
-                        logger.info(f"Tool done → {tool_name}: {status} {preview}")
-                        await self._send_result(ws, payload, result)
+                        spawn(self._run_tool_task(ws, payload, tools_by_name))
 
                     elif event == "phx_reply" and isinstance(payload, dict) and payload.get("status") == "error":
                         # e.g. a rejected register_port — surface it, don't die
@@ -295,6 +295,11 @@ class Norns:
             finally:
                 self._ws = None
                 heartbeat_task.cancel()
+                # In-flight results can't be delivered on the next
+                # connection — the orchestrator re-dispatches on disconnect
+                # and idempotency skips completed side effects.
+                for task in in_flight:
+                    task.cancel()
 
     def _check_join_reply(self, msg):
         """Raise on a failed channel join instead of pretending we're ready.
@@ -324,6 +329,38 @@ class Norns:
         self._ref_counter += 1
         msg = json.dumps(["1", str(self._ref_counter), "worker:lobby", event, payload])
         await self._ws.send(msg)
+
+    async def _run_llm_task(self, ws, payload: dict):
+        """Handle one llm_task to completion: execute, log, send the result."""
+        tools_list = [t.get("name") for t in payload.get("tools", [])]
+        logger.info(
+            f"LLM call → {payload.get('model', '?')} "
+            f"({len(payload.get('messages', []))} messages, {len(tools_list)} tools)"
+        )
+        result = await self._handle_llm_task(payload)
+        finish = result.get("finish_reason", result.get("status", "?"))
+        logger.info(f"LLM done → {finish}")
+        await self._try_send_result(ws, payload, result)
+
+    async def _run_tool_task(self, ws, payload: dict, tools_by_name: dict[str, ToolDef]):
+        """Handle one tool_task to completion: execute, log, send the result."""
+        tool_name = payload.get("tool_name", "?")
+        logger.info(f"Tool call → {tool_name}")
+        result = await self._handle_tool_task(payload, tools_by_name)
+        status = result.get("status", "?")
+        preview = str(result.get("result", result.get("error", "")))[:80]
+        logger.info(f"Tool done → {tool_name}: {status} {preview}")
+        await self._try_send_result(ws, payload, result)
+
+    async def _try_send_result(self, ws, task: dict, result: dict):
+        """Send a result, tolerating a connection that died mid-task."""
+        try:
+            await self._send_result(ws, task, result)
+        except Exception as e:
+            logger.warning(
+                f"Could not deliver result for task {task.get('task_id', '?')} "
+                f"({e}); the orchestrator re-dispatches it on reconnect"
+            )
 
     async def _handle_llm_task(self, task: dict) -> dict:
         """Execute an LLM call via LiteLLM.
