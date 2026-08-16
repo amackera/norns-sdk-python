@@ -69,3 +69,36 @@ def test_gard_destroyed_is_exported():
     from norns import GardDestroyed as exported
 
     assert exported is GardDestroyed
+
+
+def test_run_reads_gard_from_environment(norns, agent, monkeypatch):
+    """A provisioner hands the worker its gard via env (volund sets these)."""
+    monkeypatch.setenv("NORNS_GARD", "7")
+    monkeypatch.setenv("NORNS_GARD_CLAIM_TOKEN", "tok_env")
+    monkeypatch.setattr(Norns, "_ensure_agent", lambda self, a: None)
+
+    async def noop_loop(self, a, wid):
+        pass
+
+    monkeypatch.setattr(Norns, "_run_loop", noop_loop)
+
+    norns.run(agent)
+
+    assert norns._gard == "7"
+    assert norns._claim_token == "tok_env"
+
+
+def test_run_explicit_gard_beats_environment(norns, agent, monkeypatch):
+    monkeypatch.setenv("NORNS_GARD", "7")
+    monkeypatch.setenv("NORNS_GARD_CLAIM_TOKEN", "tok_env")
+    monkeypatch.setattr(Norns, "_ensure_agent", lambda self, a: None)
+
+    async def noop_loop(self, a, wid):
+        pass
+
+    monkeypatch.setattr(Norns, "_run_loop", noop_loop)
+
+    norns.run(agent, gard=9, claim_token="tok_param")
+
+    assert norns._gard == 9
+    assert norns._claim_token == "tok_param"

@@ -95,8 +95,11 @@ class Norns:
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
         self._ensure_agent(agent)
-        self._gard = gard
-        self._claim_token = claim_token
+        # NORNS_GARD / NORNS_GARD_CLAIM_TOKEN mirror NORNS_WORKER_ID below:
+        # a provisioner (volund) hands the worker its gard through the
+        # environment so scaffolded workers need no code changes.
+        self._gard = gard or os.environ.get("NORNS_GARD")
+        self._claim_token = claim_token or os.environ.get("NORNS_GARD_CLAIM_TOKEN")
 
         # NORNS_WORKER_ID lets a provisioner give the worker a stable
         # identity (volund sets it to the deployment name) so operators
